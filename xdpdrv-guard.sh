@@ -57,11 +57,163 @@ DEFAULT_TELEGRAM_CHAT_ID=""
 log() { printf '[%s] %s\n' "$PROGRAM_NAME" "$*"; }
 err() { printf '[%s] ERROR: %s\n' "$PROGRAM_NAME" "$*" >&2; }
 
+# Minimal JSON string escaper. Handles the four characters that actually
+# show up in our values: backslash, double quote, newline, tab. We don't
+# emit raw control bytes anywhere in the status output, so this is enough
+# to be compliant. AUDIT §2.5 (partial).
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+# Test whether `--json` appears anywhere in the args list. Used by status
+# reporters to switch between KEY=VALUE and JSON output.
+has_json_flag() {
+  local a
+  for a in "$@"; do
+    if [[ "$a" == "--json" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Pure-bash whitespace trim. Replaces the legacy `echo "$x" | xargs`
+# pattern that forked two subprocesses per call and additionally squashed
+# *internal* whitespace (which we never wanted in port-token parsing).
+# AUDIT §3.5.
+trim_ws() {
+  local s="${1-}"
+  s="${s#"${s%%[![:space:]]*}"}"   # strip leading whitespace
+  s="${s%"${s##*[![:space:]]}"}"   # strip trailing whitespace
+  printf '%s' "$s"
+}
+
 require_root() {
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
     err "This command must be run as root."
     exit 1
   fi
+}
+
+usage_extended() {
+  cat <<'EOF'
+xdpdrv-guard — XDP-driver-mode SYN guard with decoupled nftables fallback.
+
+For a 5-minute walkthrough see README.md.
+For incident response see docs/runbook.md.
+For design rationale see docs/architecture.md.
+
+============================== Top-level commands =============================
+
+up            Bring the host into the protected state.
+              [--iface IFACE]            Pick the interface (default: route default).
+              [--with-deps]              apt-install required packages first.
+              [--with-config]            Drop /etc/xdpdrv-guard.conf if absent.
+              [--no-persist]             Don't enable the systemd unit. Runtime
+                                         only; protection vanishes on reboot.
+              [--skip-self-test]         Skip the attach/detach probe.
+
+down          Unprotect the host.
+              [--iface IFACE]
+              [--keep-service]           Don't remove the systemd unit.
+              [--keep-fw]                Don't remove the nft tier.
+
+doctor        Comprehensive diagnostic. ALWAYS run this first when something
+              breaks — it bundles status / fw-status / health / self-test.
+              [--iface IFACE] [--quick]
+
+config-ui     Interactive prompt: scan listening ports via `ss`, let you fold
+              them into ALLOWED_*_PORTS, save to /etc/xdpdrv-guard.conf, apply.
+
+rules-ui      Interactive menu: view / append / delete TCP/UDP ports or ranges,
+              save and apply.
+
+============================== Reporting =====================================
+
+status        Print runtime state. Add --json for machine-readable output.
+              [--iface IFACE] [--json]
+
+value-report  Quantify the protection: PPS, NET_RX softirq, conntrack, SYN_RECV
+              and ESTABLISHED deltas over N seconds.
+              [--iface IFACE] [--seconds N] [--tg]
+
+surface-audit Read-only public-exposure audit. Uses `nft -j` JSON to infer
+              which ports are actually reachable. Falls back to regex if jq
+              is missing.
+              [--iface IFACE] [--tg]
+
+login-report  Print the report that the MOTD hook caches.
+              [--iface IFACE]
+
+============================== Firewall (nft) tier ===========================
+
+fw-status     Print the state of the decoupled `inet xdpdrv_guard` table.
+              [--json]
+
+fw-sync-install   Install the systemd timer that syncs ALLOWED_TCP_PORTS with
+                  the host's nft / iptables / ufw rules every 30 s.
+                  [--iface IFACE]
+fw-sync-remove    Uninstall the timer + service + state.
+fw-sync-status    Show the timer's enabled/active state and the last fingerprint.
+                  [--json]
+fw-sync-now       Force one synchronization round NOW (debug).
+                  [--iface IFACE]
+
+============================== MOTD =========================================
+
+motd-install  Register an /etc/update-motd.d hook. Cached at /run/xdpdrv-guard/
+              motd.txt with a 60 s TTL so sftp/scp/per-session ssh isn't slow.
+              [--iface IFACE]
+motd-remove   Unregister the MOTD hook + clear the cache.
+
+============================== Notifications =================================
+
+tg-test       Send a Telegram test message. Requires TELEGRAM_* in conf.
+
+============================== Meta ==========================================
+
+--version | -V | version    Print version and exit.
+--help    | -h | help        Print short usage.
+--help-all                   Print this extended help.
+
+============================== Internal entrypoints ==========================
+
+These are invoked by the systemd units. Don't run them by hand.
+  _fw-apply / _fw-sync-run / _runtime-install / _runtime-uninstall / _health-check
+
+============================== Configuration =================================
+
+Read from /etc/xdpdrv-guard.conf (root-owned, mode <= 0644). Whitelisted KEYs:
+
+  ALLOWED_TCP_PORTS              CSV / range, e.g. "22,80,443" or "10000-10100"
+  ALLOWED_UDP_PORTS              CSV / range; empty = no UDP guard
+  IFACE                          Pin the iface (else autodetect from default route)
+  AUTO_ALLOW_SSH_PORTS           0/1 — fold sshd's listen ports into TCP allow
+  ALLOWED_TCP_SYN_RATE_PER_SEC   integer — nft rate-limit on allowed ports
+  BLOCK_PUBLIC_TCP_PORTS         CSV — drop ALL packets on these public-iface ports
+  TELEGRAM_ENABLED               0/1
+  TELEGRAM_BOT_TOKEN             from @BotFather
+  TELEGRAM_CHAT_ID               user / group / channel id
+
+The parser rejects values containing $(), backticks, ;, &&, ||, |, <, > .
+
+============================== Files & paths ================================
+
+  $BASE_DIR/build/xdp_syn_guard.{c,o,o.srchash}
+  /etc/xdpdrv-guard.conf
+  /etc/default/xdpdrv-guard{,-sync}
+  /etc/systemd/system/xdpdrv-guard{,-fw-sync}.service
+  /etc/systemd/system/xdpdrv-guard-fw-sync.timer
+  /etc/update-motd.d/99-xdpdrv-guard
+  /var/lib/xdpdrv-guard/{runtime.env,firewall.env,firewall_sync.hash}
+  /var/lock/xdpdrv-guard.lock
+  /run/xdpdrv-guard/motd.txt
+EOF
 }
 
 usage() {
@@ -82,7 +234,11 @@ Usage:
   xdpdrv-guard.sh motd-install [--iface IFACE]
   xdpdrv-guard.sh motd-remove
   xdpdrv-guard.sh login-report [--iface IFACE]
+  xdpdrv-guard.sh status [--iface IFACE] [--json]
+  xdpdrv-guard.sh fw-status [--json]
+  xdpdrv-guard.sh fw-sync-status [--json]
   xdpdrv-guard.sh --version | -V
+  xdpdrv-guard.sh --help-all                  (extended help with every flag)
 
 Description:
   - Only uses xdpdrv mode (native). Never falls back to xdpgeneric.
@@ -371,7 +527,7 @@ csv_contains_port() {
   IFS=',' read -r -a tokens <<< "$csv"
   for raw in "${tokens[@]}"; do
     local token
-    token="$(echo "$raw" | xargs)"
+    token="$(trim_ws "$raw")"
     [[ -z "$token" ]] && continue
     if [[ "$token" == "$port" ]]; then
       return 0
@@ -390,7 +546,7 @@ append_ports_to_csv() {
   IFS=',' read -r -a extras <<< "$extra_csv"
   for raw in "${extras[@]}"; do
     local port
-    port="$(echo "$raw" | xargs)"
+    port="$(trim_ws "$raw")"
     [[ -z "$port" ]] && continue
     if ! [[ "$port" =~ ^[0-9]+$ ]]; then
       continue
@@ -508,14 +664,14 @@ parse_ports_to_c_ranges() {
   IFS=',' read -r -a tokens <<< "$ports_csv"
   for raw in "${tokens[@]}"; do
     local token start end
-    token="$(echo "$raw" | xargs)"
+    token="$(trim_ws "$raw")"
     [[ -z "$token" ]] && continue
 
     if [[ "$token" == *"-"* ]]; then
       start="${token%%-*}"
       end="${token##*-}"
-      start="$(echo "$start" | xargs)"
-      end="$(echo "$end" | xargs)"
+      start="$(trim_ws "$start")"
+      end="$(trim_ws "$end")"
 
       if ! [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]]; then
         err "Invalid range token in ${err_var_name}: $token"
@@ -567,14 +723,14 @@ parse_ports_to_nft_set() {
   IFS=',' read -r -a tokens <<< "$ports_csv"
   for raw in "${tokens[@]}"; do
     local token start end
-    token="$(echo "$raw" | xargs)"
+    token="$(trim_ws "$raw")"
     [[ -z "$token" ]] && continue
 
     if [[ "$token" == *"-"* ]]; then
       start="${token%%-*}"
       end="${token##*-}"
-      start="$(echo "$start" | xargs)"
-      end="$(echo "$end" | xargs)"
+      start="$(trim_ws "$start")"
+      end="$(trim_ws "$end")"
 
       if ! [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]]; then
         err "Invalid range token in ALLOWED_TCP_PORTS: $token"
@@ -642,7 +798,7 @@ is_valid_port_token() {
   local token="$1"
   local start end
 
-  token="$(echo "$token" | xargs)"
+  token="$(trim_ws "$token")"
   [[ -z "$token" ]] && return 1
 
   if [[ "$token" == *"-"* ]]; then
@@ -667,7 +823,7 @@ expand_ports_csv_to_lines() {
   IFS=',' read -r -a tokens <<< "$csv"
   for raw in "${tokens[@]}"; do
     local token start end p
-    token="$(echo "$raw" | xargs)"
+    token="$(trim_ws "$raw")"
     [[ -z "$token" ]] && continue
 
     if ! is_valid_port_token "$token"; then
@@ -773,13 +929,19 @@ csv_remove_token_compact() {
   remove_file=$(mktemp)
   out_file=$(mktemp)
 
-  expand_ports_csv_to_lines "$base_csv" "PORTS" > "$base_file"
-  expand_ports_csv_to_lines "$token_csv" "PORTS" > "$remove_file"
-  comm -23 "$base_file" "$remove_file" > "$out_file" || true
+  # `comm` requires lexicographically sorted input (LC_ALL=C, default sort
+  # order); expand_ports_csv_to_lines uses `sort -n -u` (numeric), which
+  # disagrees with comm on multi-digit boundaries (e.g. "100" < "99"
+  # lexically). Sort here explicitly before comm to silence the
+  # `comm: file 1 is not in sorted order` warnings and ensure correctness.
+  expand_ports_csv_to_lines "$base_csv"  "PORTS" | LC_ALL=C sort -u > "$base_file"
+  expand_ports_csv_to_lines "$token_csv" "PORTS" | LC_ALL=C sort -u > "$remove_file"
+  LC_ALL=C comm -23 "$base_file" "$remove_file" > "$out_file" || true
 
   local out=""
   if [[ -s "$out_file" ]]; then
-    out="$(compress_ports_lines_to_csv < "$out_file")"
+    # compress_ports_lines_to_csv expects numerically sorted input.
+    out="$(sort -n < "$out_file" | compress_ports_lines_to_csv)"
   fi
 
   rm -f "$base_file" "$remove_file" "$out_file"
@@ -795,7 +957,7 @@ port_in_csv() {
   IFS=',' read -r -a tokens <<< "$csv"
   for raw in "${tokens[@]}"; do
     local token start end
-    token="$(echo "$raw" | xargs)"
+    token="$(trim_ws "$raw")"
     [[ -z "$token" ]] && continue
     if [[ "$token" == *"-"* ]]; then
       start="${token%%-*}"
@@ -867,7 +1029,7 @@ collect_ports_from_lines() {
   local out_csv=""
   local token
   while IFS= read -r token; do
-    token="$(echo "$token" | xargs)"
+    token="$(trim_ws "$token")"
     [[ -z "$token" ]] && continue
     if ! is_valid_port_token "$token"; then
       continue
@@ -1380,6 +1542,32 @@ cmd_fw_status() {
     table_mode="absent"
   fi
 
+  if has_json_flag "$@"; then
+    local fw_iface="" fw_tcp="" fw_block="" fw_updated="" state_present=false
+    if [[ -f "$FW_STATE_FILE" ]]; then
+      state_present=true
+      while IFS='=' read -r k v; do
+        case "$k" in
+          IFACE) fw_iface="$v" ;;
+          ALLOWED_TCP_PORTS) fw_tcp="$v" ;;
+          BLOCK_PUBLIC_TCP_PORTS) fw_block="$v" ;;
+          UPDATED_AT) fw_updated="$v" ;;
+        esac
+      done < "$FW_STATE_FILE"
+    fi
+    printf '{'
+    printf '"firewall_stack":"%s",'    "$(json_escape "$stack")"
+    printf '"xdpdrv_guard_table":"%s",' "$(json_escape "$table_mode")"
+    printf '"fw_state_present":%s,'    "$state_present"
+    printf '"runtime":{"iface":"%s","allowed_tcp_ports":"%s","block_public_tcp_ports":"%s","updated_at":"%s"}' \
+      "$(json_escape "$fw_iface")" \
+      "$(json_escape "$fw_tcp")" \
+      "$(json_escape "$fw_block")" \
+      "$(json_escape "$fw_updated")"
+    printf '}\n'
+    return 0
+  fi
+
   echo "firewall_stack=$stack"
   echo "xdpdrv_guard_table=$table_mode"
 
@@ -1662,23 +1850,45 @@ cmd_fw_sync_status() {
   timer_name="$(basename "$FW_SYNC_SYSTEMD_TIMER_FILE")"
   service_name="$(basename "$FW_SYNC_SYSTEMD_SERVICE_FILE")"
 
-  echo "fw_sync_timer_file=$FW_SYNC_SYSTEMD_TIMER_FILE"
-  echo "fw_sync_service_file=$FW_SYNC_SYSTEMD_SERVICE_FILE"
-  echo "fw_sync_hash_file=$FW_SYNC_HASH_FILE"
+  local fw_sync_hash="absent"
   if [[ -f "$FW_SYNC_HASH_FILE" ]]; then
-    echo "fw_sync_hash=$(cat "$FW_SYNC_HASH_FILE")"
-  else
-    echo "fw_sync_hash=absent"
+    fw_sync_hash="$(cat "$FW_SYNC_HASH_FILE" 2>/dev/null || echo absent)"
   fi
 
+  local timer_enabled="" timer_active="" service_active="" systemd_present=true
   if command -v systemctl >/dev/null 2>&1; then
-    local timer_enabled timer_active service_active
     timer_enabled="$(systemctl is-enabled "$timer_name" 2>/dev/null || true)"
     timer_active="$(systemctl is-active "$timer_name" 2>/dev/null || true)"
     service_active="$(systemctl is-active "$service_name" 2>/dev/null || true)"
     [[ -z "$timer_enabled" ]] && timer_enabled="disabled"
     [[ -z "$timer_active" ]] && timer_active="inactive"
     [[ -z "$service_active" ]] && service_active="inactive"
+  else
+    systemd_present=false
+  fi
+
+  if has_json_flag "$@"; then
+    printf '{'
+    printf '"fw_sync_timer_file":"%s",'   "$(json_escape "$FW_SYNC_SYSTEMD_TIMER_FILE")"
+    printf '"fw_sync_service_file":"%s",' "$(json_escape "$FW_SYNC_SYSTEMD_SERVICE_FILE")"
+    printf '"fw_sync_hash_file":"%s",'    "$(json_escape "$FW_SYNC_HASH_FILE")"
+    printf '"fw_sync_hash":"%s",'         "$(json_escape "$fw_sync_hash")"
+    printf '"systemd_present":%s'         "$systemd_present"
+    if $systemd_present; then
+      printf ',"timer_enabled":"%s","timer_active":"%s","service_active":"%s"' \
+        "$(json_escape "$timer_enabled")" \
+        "$(json_escape "$timer_active")" \
+        "$(json_escape "$service_active")"
+    fi
+    printf '}\n'
+    return 0
+  fi
+
+  echo "fw_sync_timer_file=$FW_SYNC_SYSTEMD_TIMER_FILE"
+  echo "fw_sync_service_file=$FW_SYNC_SYSTEMD_SERVICE_FILE"
+  echo "fw_sync_hash_file=$FW_SYNC_HASH_FILE"
+  echo "fw_sync_hash=$fw_sync_hash"
+  if $systemd_present; then
     echo "timer_enabled=$timer_enabled"
     echo "timer_active=$timer_active"
     echo "service_active=$service_active"
@@ -2688,11 +2898,58 @@ cmd_status() {
   iface=$(parse_iface "$@")
   validate_iface "$iface"
 
+  local link_summary xdp_mode="detached"
+  link_summary="$(ip -d link show dev "$iface" 2>/dev/null | sed -n '1,6p')"
+  if printf '%s' "$link_summary" | grep -q 'xdpdrv/id:'; then
+    xdp_mode="xdpdrv"
+  elif printf '%s' "$link_summary" | grep -q 'xdpgeneric/id:'; then
+    xdp_mode="xdpgeneric"
+  elif printf '%s' "$link_summary" | grep -q 'xdp/id:'; then
+    xdp_mode="xdp"
+  fi
+
+  if has_json_flag "$@"; then
+    local state_present=false
+    local runtime_iface="" runtime_obj="" runtime_tcp="" runtime_udp="" runtime_updated=""
+    if [[ -f "$STATE_FILE" ]]; then
+      state_present=true
+      # State file is KEY=VALUE format, written by save_state(); read with
+      # a transient subshell to avoid polluting outer scope.
+      while IFS='=' read -r k v; do
+        case "$k" in
+          IFACE) runtime_iface="$v" ;;
+          OBJ_FILE) runtime_obj="$v" ;;
+          ALLOWED_TCP_PORTS) runtime_tcp="$v" ;;
+          ALLOWED_UDP_PORTS) runtime_udp="$v" ;;
+          UPDATED_AT) runtime_updated="$v" ;;
+        esac
+      done < "$STATE_FILE"
+    fi
+    printf '{'
+    printf '"program":"%s",'  "$(json_escape "$PROGRAM_NAME")"
+    printf '"version":"%s",'  "$(json_escape "$VERSION")"
+    printf '"iface":"%s",'    "$(json_escape "$iface")"
+    printf '"allowed_tcp_ports":"%s",' "$(json_escape "${ALLOWED_TCP_PORTS:-}")"
+    printf '"allowed_udp_ports":"%s",' "$(json_escape "${ALLOWED_UDP_PORTS:-}")"
+    printf '"xdp_mode":"%s",' "$(json_escape "$xdp_mode")"
+    printf '"state_present":%s,' "$state_present"
+    printf '"runtime":{"iface":"%s","obj_file":"%s","allowed_tcp_ports":"%s","allowed_udp_ports":"%s","updated_at":"%s"},' \
+      "$(json_escape "$runtime_iface")" \
+      "$(json_escape "$runtime_obj")" \
+      "$(json_escape "$runtime_tcp")" \
+      "$(json_escape "$runtime_udp")" \
+      "$(json_escape "$runtime_updated")"
+    printf '"link_summary":"%s"' "$(json_escape "$link_summary")"
+    printf '}\n'
+    return 0
+  fi
+
   echo "program=$PROGRAM_NAME"
   echo "version=$VERSION"
   echo "iface=$iface"
   echo "allowed_tcp_ports=${ALLOWED_TCP_PORTS:-}"
   echo "allowed_udp_ports=${ALLOWED_UDP_PORTS:-}"
+  echo "xdp_mode=$xdp_mode"
 
   if [[ -f "$STATE_FILE" ]]; then
     echo "state_file=$STATE_FILE"
@@ -2702,7 +2959,7 @@ cmd_status() {
   fi
 
   echo
-  ip -d link show dev "$iface" | sed -n '1,6p'
+  printf '%s\n' "$link_summary"
 }
 
 cmd_init_config() {
@@ -2988,7 +3245,10 @@ main() {
     -V|--version|version)
       printf '%s %s\n' "$PROGRAM_NAME" "$VERSION"
       ;;
+    --help-all|help-all) usage_extended ;;
     -h|--help|help|"") usage ;;
+    status) cmd_status "$@" ;;
+    fw-status) cmd_fw_status "$@" ;;
     *)
       err "Unknown command: $cmd"
       usage
@@ -2997,4 +3257,8 @@ main() {
   esac
 }
 
-main "$@"
+# When sourced from a test harness (`__XDPDRV_GUARD_TEST_MODE=1 source …`), do
+# not auto-invoke main — the harness calls individual helpers directly.
+if [[ -z "${__XDPDRV_GUARD_TEST_MODE:-}" ]]; then
+  main "$@"
+fi

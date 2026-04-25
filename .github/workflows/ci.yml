@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+jobs:
+
+  # -------------------------------------------------------------------------
+  # Static analysis on the bash script.
+  #
+  # Severity = "warning" is the deliberate gate today (the legacy `echo |
+  # xargs` paths trip "style" warnings and are tracked in AUDIT §3.5).
+  # SC1090/SC1091 are silenced because the script intentionally sources a
+  # conf at /etc/xdpdrv-guard.conf that shellcheck cannot see at lint time.
+  # -------------------------------------------------------------------------
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -y && sudo apt-get install -y shellcheck
+      - name: Lint xdpdrv-guard.sh
+        run: |
+          shellcheck --version
+          shellcheck -S warning -e SC1090,SC1091 xdpdrv-guard.sh
+
+  # -------------------------------------------------------------------------
+  # bash -n: pure syntax check. Cheap belt-and-braces.
+  # -------------------------------------------------------------------------
+  bash-syntax:
+    name: bash -n
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n xdpdrv-guard.sh
+
+  # -------------------------------------------------------------------------
+  # Unit tests for the pure-bash helpers (csv parser, conf whitelist,
+  # fingerprint stripper). Runs as the default GitHub-Actions user;
+  # the world-writable rejection test self-skips when not root.
+  # -------------------------------------------------------------------------
+  bats:
+    name: bats unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats + jq
+        run: sudo apt-get update -y && sudo apt-get install -y bats jq
+      - name: Run bats
+        run: |
+          bats --version
+          bats --tap tests/
+
+  # -------------------------------------------------------------------------
+  # Compile the checked-in data-plane source with `clang -target bpf`.
+  # Catches stupid C-level breakage (missing kernel headers, IPv6 ext
+  # header parser typos, VLAN unwrap typos) before any kernel ever sees
+  # it. We don't load the program here — that would need a kernel and
+  # XDP-capable iface, neither of which github-runners have natively.
+  # -------------------------------------------------------------------------
+  bpf-compile:
+    name: bpf-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang + kernel headers
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang llvm linux-libc-dev libc6-dev
+      - name: Compile build/xdp_syn_guard.c
+        run: |
+          clang --version
+          clang -O2 -target bpf \
+            -I/usr/include \
+            -I/usr/include/x86_64-linux-gnu \
+            -c build/xdp_syn_guard.c \
+            -o /tmp/xdp_syn_guard.o
+          file /tmp/xdp_syn_guard.o
+          # Smoke-check ELF marker.
+          test -s /tmp/xdp_syn_guard.o

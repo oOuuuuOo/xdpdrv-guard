@@ -1,48 +1,130 @@
+# =====================================================================
 # xdpdrv-guard configuration
+# =====================================================================
 #
-# Comma-separated TCP ports and ranges that should continue to accept new TCP SYN traffic.
-# Any unsolicited TCP SYN to other ports is dropped at XDP layer.
+# Read at runtime by /usr/local/bin/xdpdrv-guard.sh (or wherever you ship
+# the repo). Format: KEY=VALUE, # for comments.
 #
-# IMPORTANT:
-# - Include every public TCP service port/range you actually use.
-# - Keep this minimal. Empty means drop all unsolicited TCP SYN.
-# - Tailscale SSH over tailscale0 is unaffected by this setting on eth0.
+# Parser is a strict whitelist (v0.1.1+). DO NOT use:
+#   - Command substitution: $(...) or `...`
+#   - Statement separators / pipes / redirection: ; && || | < >
+# Unrecognized KEYs are silently ignored.
 #
-# Examples:
-#   ALLOWED_TCP_PORTS="22,80,443,8443"
-#   ALLOWED_TCP_PORTS="22,80-81,443,10000-10100"
+# Permissions: this file MUST be owned by root and not group/world
+# writable (mode <= 0644). The script refuses to load otherwise.
+#   sudo chown root:root /etc/xdpdrv-guard.conf
+#   sudo chmod 0644      /etc/xdpdrv-guard.conf
+#
+# After editing:
+#   sudo /path/to/xdpdrv-guard.sh up --iface eth0
+# (or `systemctl reload xdpdrv-guard.service` if using systemd persistence)
+#
+# =====================================================================
+# Quickstart presets — uncomment ONE block, delete the rest.
+# =====================================================================
+#
+# --- Preset A: conservative / first-time defaults --------------------
+# ALLOWED_TCP_PORTS="22,80,443"
+# ALLOWED_UDP_PORTS=""
+# AUTO_ALLOW_SSH_PORTS=1
+# ALLOWED_TCP_SYN_RATE_PER_SEC=0
+# BLOCK_PUBLIC_TCP_PORTS=""
+#
+# --- Preset B: tailscale-only SSH (public 22 fully blocked) ----------
+# ALLOWED_TCP_PORTS="80,443"
+# ALLOWED_UDP_PORTS=""
+# AUTO_ALLOW_SSH_PORTS=0
+# ALLOWED_TCP_SYN_RATE_PER_SEC=0
+# BLOCK_PUBLIC_TCP_PORTS="22"
+#
+# --- Preset C: web service exposed to the internet, mild SYN risk ----
+# ALLOWED_TCP_PORTS="22,80,443"
+# ALLOWED_UDP_PORTS=""
+# AUTO_ALLOW_SSH_PORTS=1
+# ALLOWED_TCP_SYN_RATE_PER_SEC=2000
+# BLOCK_PUBLIC_TCP_PORTS=""
+#
+# --- Preset D: Wireguard / DNS / TURN node (UDP-heavy) ---------------
+# ALLOWED_TCP_PORTS="22"
+# ALLOWED_UDP_PORTS="53,3478,51820"
+# AUTO_ALLOW_SSH_PORTS=1
+# ALLOWED_TCP_SYN_RATE_PER_SEC=0
+# BLOCK_PUBLIC_TCP_PORTS=""
+#
+# =====================================================================
+# Active settings (edit below)
+# =====================================================================
 
+# ---------------------------------------------------------------------
+# ALLOWED_TCP_PORTS
+# ---------------------------------------------------------------------
+# Comma-separated TCP destination ports / ranges that may receive new
+# TCP SYN traffic. Anything outside this list gets XDP_DROP at the
+# driver hook AND a counter+drop in the decoupled nft chain.
+#
+# Format:
+#   single port:  "443"
+#   list:         "22,80,443,8443"
+#   range:        "10000-10100"
+#   mixed:        "22,80-81,443,10000-10100"
+#
+# WARNING: empty value means "drop ALL unsolicited TCP SYN" — usually
+# only useful when paired with AUTO_ALLOW_SSH_PORTS=1 on a tailscale-
+# only host where SSH won't traverse this iface anyway.
 ALLOWED_TCP_PORTS="34443"
 
-# Optional UDP guard at XDP layer.
-# When non-empty, UDP packets targeting ports outside this list are dropped at XDP.
-# Empty means UDP guard is disabled (keep previous behavior).
-# Examples:
-#   ALLOWED_UDP_PORTS="53,3478,51820"
-#   ALLOWED_UDP_PORTS="10000-10100"
+# ---------------------------------------------------------------------
+# ALLOWED_UDP_PORTS
+# ---------------------------------------------------------------------
+# When non-empty: UDP destination ports outside this list are dropped
+# at the XDP layer. When empty: UDP guard is disabled (script does not
+# touch UDP). Same syntax as ALLOWED_TCP_PORTS.
 ALLOWED_UDP_PORTS=""
 
-# Auto include currently listening sshd TCP ports into runtime allow-list.
-# 0 is recommended for tailscale-only SSH (avoid exposing 22 on public iface).
-# Set to 1 only when you intentionally need public-IFACE SSH continuity.
+# ---------------------------------------------------------------------
+# AUTO_ALLOW_SSH_PORTS  (0 / 1)
+# ---------------------------------------------------------------------
+# 1 = at runtime, merge whatever ports `sshd` is currently listening on
+#     into ALLOWED_TCP_PORTS (helps avoid locking yourself out).
+# 0 = do not. Recommended for hosts where SSH only goes over a
+#     dedicated interface (tailscale0 / wg0 / mgmt VLAN), so the public
+#     iface really doesn't need 22 open.
 AUTO_ALLOW_SSH_PORTS=0
 
-# Optional SYN rate limit (per second) for allowed TCP ports in decoupled nft chain.
-# 0 means disabled.
-# Example: 2000
+# ---------------------------------------------------------------------
+# ALLOWED_TCP_SYN_RATE_PER_SEC  (non-negative integer)
+# ---------------------------------------------------------------------
+# 0    = disabled (default).
+# >0   = in the decoupled nft chain, attach a `limit rate over N/second
+#        counter drop` rule on ALLOWED_TCP_PORTS, so even an opened port
+#        is shielded from small SYN floods. Pick something well above
+#        normal peak traffic (e.g. 2000 for a small web service).
+# Tune by watching `value-report` and the nft counter on the rate rule.
 ALLOWED_TCP_SYN_RATE_PER_SEC=0
 
-# Optional hard-drop list for public IFACE TCP ports (all packets, not only SYN).
-# Useful for tailscale-only SSH: set BLOCK_PUBLIC_TCP_PORTS="22"
+# ---------------------------------------------------------------------
+# BLOCK_PUBLIC_TCP_PORTS
+# ---------------------------------------------------------------------
+# Comma-separated TCP ports that should be hard-dropped on the public
+# iface (NOT just SYN — every packet, including in-progress TCP).
+# Standard tailscale-only-SSH posture is: BLOCK_PUBLIC_TCP_PORTS="22".
+# Same format as ALLOWED_TCP_PORTS.
 BLOCK_PUBLIC_TCP_PORTS=""
 
-# Optional fixed interface. If empty, script auto-detects from default route.
+# ---------------------------------------------------------------------
+# IFACE  (optional)
+# ---------------------------------------------------------------------
+# Pin the protected interface. When empty (default), the script picks
+# the iface of the system's default route at install time.
 # IFACE="eth0"
 
-# Optional Telegram notifications
-# TELEGRAM_ENABLED=1 to enable
-# TELEGRAM_BOT_TOKEN from @BotFather
-# TELEGRAM_CHAT_ID can be user/group/channel id
+# ---------------------------------------------------------------------
+# Telegram notifications  (optional)
+# ---------------------------------------------------------------------
+# Used by `tg-test`, `value-report --tg`, `surface-audit --tg`.
+# Get a bot token from @BotFather; CHAT_ID can be a user / group /
+# channel id (find it via https://api.telegram.org/bot<TOKEN>/getUpdates
+# after sending the bot a message or adding it to your group).
 TELEGRAM_ENABLED=0
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
