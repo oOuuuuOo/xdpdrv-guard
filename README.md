@@ -3,7 +3,7 @@
 > 一句话：把"打向你机器关闭端口的 TCP SYN 扫描和洪泛"在网卡驱动那一层就丢掉，
 > 让 CPU 和防火墙不用浪费力气去处理。
 
-版本 **0.1.1** · [CHANGELOG.md](CHANGELOG.md) · [AUDIT.md](AUDIT.md) (待办与架构方向)
+版本 **0.1.1** · [CHANGELOG.md](CHANGELOG.md) 
 
 ---
 
